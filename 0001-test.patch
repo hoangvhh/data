@@ -1,0 +1,258 @@
+From 04651b294c4490a1ed7f383ebb6c6d542dccd870 Mon Sep 17 00:00:00 2001
+From: Hoang Vu <vuhuyhoang.bk@gmail.com>
+Date: Wed, 8 Dec 2021 16:33:12 +0000
+Subject: [PATCH] test
+
+---
+ mediastreamer2/configure.ac                   |   2 +
+ .../include/mediastreamer2/mscommon.h         |   3 +
+ mediastreamer2/src/audiofilters/pulseaudio.c  | 181 +++++++++++++++++-
+ 3 files changed, 182 insertions(+), 4 deletions(-)
+
+diff --git a/mediastreamer2/configure.ac b/mediastreamer2/configure.ac
+index 3fd7fff..35c6560 100644
+--- a/mediastreamer2/configure.ac
++++ b/mediastreamer2/configure.ac
+@@ -143,6 +143,8 @@ ios_found=false
+ mingw32ce_found=no
+ ios_found=no
+ 
++LIBS="$LIBS -lbctoolbox"
++
+ dnl add thread flags
+ case $host in
+ 	i386-apple*|armv6-apple*|armv7-apple*|armv7s-apple*)
+diff --git a/mediastreamer2/include/mediastreamer2/mscommon.h b/mediastreamer2/include/mediastreamer2/mscommon.h
+index a077221..b37e92d 100644
+--- a/mediastreamer2/include/mediastreamer2/mscommon.h
++++ b/mediastreamer2/include/mediastreamer2/mscommon.h
+@@ -118,6 +118,9 @@ typedef struct _MSList MSList;
+ 
+ 
+ typedef int (*MSCompareFunc)(const void *a, const void *b);
++typedef void (*MSIterateFunc)(void *a);
++typedef void (*MSIterate2Func)(void *a, void *b);
++typedef void (*MSIterate3Func)(void *a, void *b, void *c);
+ 
+ #ifdef __cplusplus
+ extern "C"{
+diff --git a/mediastreamer2/src/audiofilters/pulseaudio.c b/mediastreamer2/src/audiofilters/pulseaudio.c
+index 5efe101..4535f22 100644
+--- a/mediastreamer2/src/audiofilters/pulseaudio.c
++++ b/mediastreamer2/src/audiofilters/pulseaudio.c
+@@ -17,13 +17,34 @@ along with this program; if not, write to the Free Software
+ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ */
+ 
++#include <bctoolbox/list.h>
+ #include "mediastreamer2/msfilter.h"
+ #include "mediastreamer2/mssndcard.h"
+ 
+ #include <pulse/pulseaudio.h>
+ 
++#define PA_STRING_SIZE 256
++
++typedef struct pa_device {
++    char name[PA_STRING_SIZE];
++    char description[PA_STRING_SIZE];
++    char source_name[PA_STRING_SIZE];
++    uint8_t bidirectionnal;
++} pa_device_t;
++
++struct _PAData{
++    char *pa_id_sink;
++    char *pa_id_source;
++};
++
++typedef struct _PAData PAData;
++
+ static const float latency_req=0.02;
+ 
++static pa_context *context=NULL;
++static pa_threaded_mainloop *pa_loop=NULL;
++static bool_t pa_ready=FALSE;
++
+ static void init_pulse_context();
+ static void pulse_card_detect(MSSndCardManager *m);
+ static MSFilter *pulse_card_create_reader(MSSndCard *card);
+@@ -48,8 +69,118 @@ MSSndCardDesc pulse_card_desc={
+ 	.uninit=pulse_card_uninit
+ };
+ 
++static bool_t wait_for_context_state(pa_context_state_t success_state, pa_context_state_t failure_state){
++    pa_context_state_t state;
++    pa_threaded_mainloop_lock(pa_loop);
++    state = pa_context_get_state(context);
++    while(state != success_state && state != failure_state) {
++        pa_threaded_mainloop_wait(pa_loop);
++        state = pa_context_get_state(context);
++    }
++    pa_threaded_mainloop_unlock(pa_loop);
++    return state == success_state;
++}
++
++void pa_sinklist_cb(pa_context *c, const pa_sink_info *l, int eol, void *userdata) {
++    bctbx_list_t **pa_devicelist = userdata;
++    pa_device_t *pa_device;
++
++    /* when eol is set to a positive number : end of the list */
++    if (eol > 0) {
++        goto end;
++    }
++
++    pa_device = ms_malloc0(sizeof(pa_device_t));
++    strncpy(pa_device->name, l->name, PA_STRING_SIZE-1);
++    strncpy(pa_device->description, l->description, PA_STRING_SIZE-1);
++
++    *pa_devicelist = bctbx_list_append(*pa_devicelist, pa_device);
++    end:
++    pa_threaded_mainloop_signal(pa_loop, FALSE);
++}
++
++void pa_sourcelist_cb(pa_context *c, const pa_source_info *l, int eol, void *userdata) {
++    bctbx_list_t **pa_devicelist = userdata;
++    pa_device_t *pa_device;
++
++    if (eol > 0) {
++        goto end;
++    }
++
++    if (l->monitor_of_sink!=PA_INVALID_INDEX) { /* ignore monitors */
++        goto end;
++    }
++
++    pa_device = ms_malloc0(sizeof(pa_device_t));
++    strncpy(pa_device->name, l->name, PA_STRING_SIZE -1);
++    strncpy(pa_device->description, l->description, PA_STRING_SIZE -1);
++
++    *pa_devicelist = bctbx_list_append(*pa_devicelist, pa_device);
++    end:
++    pa_threaded_mainloop_signal(pa_loop, FALSE);
++}
++
++/* Add cards to card manager, list contains sink only and bidirectionnal cards */
++static void pulse_card_sink_create(pa_device_t *pa_device, MSSndCardManager *m) {
++    MSSndCard *card;
++    PAData *card_data;
++
++    card=ms_snd_card_new(&pulse_card_desc);
++    if(card==NULL) {
++        ms_error("Creating the pulseaudio soundcard failed");
++        return;
++    }
++    card_data = (PAData*)card->data;
++    card->name = ms_strdup(pa_device->description);
++    card_data->pa_id_sink = ms_strdup(pa_device->name);
++    /* check if this card also support capture */
++    if (pa_device->bidirectionnal==1) {
++        card->capabilities = MS_SND_CARD_CAP_PLAYBACK|MS_SND_CARD_CAP_CAPTURE;
++        card_data->pa_id_source=strdup(pa_device->source_name);
++    } else {
++        card->capabilities = MS_SND_CARD_CAP_PLAYBACK;
++    }
++    ms_snd_card_manager_add_card(m, card);
++}
++
++/* Add cards to card manager, list contains source only cards */
++static void pulse_card_source_create(pa_device_t *pa_device, MSSndCardManager *m) {
++    MSSndCard *card;
++    PAData *card_data;
++
++    card=ms_snd_card_new(&pulse_card_desc);
++    if(card==NULL) {
++        ms_error("Creating the pulseaudio soundcard failed");
++        return;
++    }
++    card_data = (PAData*)card->data;
++    card->name = ms_strdup(pa_device->description);
++    card->capabilities = MS_SND_CARD_CAP_CAPTURE;
++    card_data->pa_id_source = strdup(pa_device->name);
++    ms_snd_card_manager_add_card(m, card);
++}
++
++/* card source and sink list merging into sink list :
++ * output: sink and bidirectionnal cards into sink list, source only card into source list
++ * merging is based on pulse audio card description */
++int pulse_card_compare(pa_device_t *sink, pa_device_t *source) {
++    return strncmp(sink->description, source->description, 512);
++}
++
++static void pulse_card_merge_lists(pa_device_t *pa_device, bctbx_list_t **pa_source_list) {
++    bctbx_list_t *sourceCard = bctbx_list_find_custom(*pa_source_list, (bctbx_compare_func)pulse_card_compare, pa_device);
++    if (sourceCard!= NULL) {
++        pa_device_t *sourceCard_data = (pa_device_t *)sourceCard->data;
++        pa_device->bidirectionnal = 1;
++        strncpy(pa_device->source_name,sourceCard_data->name, PA_STRING_SIZE);
++        *pa_source_list = bctbx_list_remove(*pa_source_list, sourceCard->data);
++        ms_free(sourceCard_data);
++    }
++}
+ 
+ static void pulse_card_detect(MSSndCardManager *m){
++/*
++    // bionic
+ 	MSSndCard *card=ms_snd_card_new(&pulse_card_desc);
+ 	if (card!=NULL){
+ 		card->name=ms_strdup("default");
+@@ -57,12 +188,54 @@ static void pulse_card_detect(MSSndCardManager *m){
+ 		ms_snd_card_manager_add_card(m,card);
+ 		init_pulse_context();
+ 	}
++//*/
++//*/
++    // focal
++    pa_operation *pa_op;
++    bctbx_list_t *pa_sink_list=NULL;
++    bctbx_list_t *pa_source_list=NULL;
++
++    /* connect to pulse server */
++    init_pulse_context();
++    if(!wait_for_context_state(PA_CONTEXT_READY, PA_CONTEXT_FAILED)) {
++        ms_error("Connection to the pulseaudio server failed");
++        return;
++    }
++
++    pa_threaded_mainloop_lock(pa_loop);
++
++    /* retrieve all available sinks */
++    pa_op = pa_context_get_sink_info_list(context, pa_sinklist_cb, &pa_sink_list);
++
++    /* wait for the operation to complete */
++    while (pa_operation_get_state(pa_op) != PA_OPERATION_DONE) {
++        pa_threaded_mainloop_wait(pa_loop);
++    }
++    pa_operation_unref(pa_op);
++
++    /* retrieve all available sources, monitors are ignored */
++    pa_op = pa_context_get_source_info_list(context, pa_sourcelist_cb, &pa_source_list);
++
++    /* wait for the operation to complete */
++    while (pa_operation_get_state(pa_op) != PA_OPERATION_DONE) {
++        pa_threaded_mainloop_wait(pa_loop);
++    }
++    pa_operation_unref(pa_op);
++
++    pa_threaded_mainloop_unlock(pa_loop);
++
++    /* merge source list into sink list for dual capabilities cards */
++    bctbx_list_for_each2(pa_sink_list, (MSIterate2Func)pulse_card_merge_lists, &pa_source_list);
++
++    /* create sink and souce cards */
++    bctbx_list_for_each2(pa_sink_list, (MSIterate2Func)pulse_card_sink_create, m);
++    bctbx_list_for_each2(pa_source_list, (MSIterate2Func)pulse_card_source_create, m);
++
++    bctbx_list_free_with_data(pa_sink_list, ms_free);
++    bctbx_list_free_with_data(pa_source_list, ms_free);
++//*/
+ }
+ 
+-static pa_context *context=NULL;
+-static pa_threaded_mainloop *pa_loop=NULL;
+-static bool_t pa_ready=FALSE;
+-
+ static void uninit_pulse_context(){
+ 	pa_context_disconnect(context);
+ 	pa_context_unref(context);
+-- 
+2.17.1
+
